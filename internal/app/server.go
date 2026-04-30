@@ -10,6 +10,7 @@ import (
 	"log"
 	"mime"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path"
@@ -146,23 +147,7 @@ func (s *Server) handleConvert(writer http.ResponseWriter, request *http.Request
 	}
 
 	request.Body = http.MaxBytesReader(writer, request.Body, maxUploadSize)
-	if err := request.ParseMultipartForm(maxUploadSize); err != nil {
-		writeJSON(writer, http.StatusBadRequest, errorResponse{Error: "unable to parse multipart form"})
-		return
-	}
-
-	params, err := parseConversionRequest(request)
-	if err != nil {
-		writeJSON(writer, http.StatusBadRequest, errorResponse{Error: err.Error()})
-		return
-	}
-
-	sourceFile, header, err := request.FormFile("video")
-	if err != nil {
-		writeJSON(writer, http.StatusBadRequest, errorResponse{Error: "video file is required"})
-		return
-	}
-	defer sourceFile.Close()
+	requestStartedAt := time.Now()
 
 	jobID, err := newJobID()
 	if err != nil {
@@ -177,50 +162,32 @@ func (s *Server) handleConvert(writer http.ResponseWriter, request *http.Request
 	}
 	defer os.RemoveAll(workspace)
 
-	inputExtension := strings.ToLower(filepath.Ext(header.Filename))
-	if inputExtension == "" {
-		inputExtension = guessExtension(header.Header.Get("Content-Type"))
-	}
-	if inputExtension == "" {
-		inputExtension = ".mp4"
-	}
-
-	inputPath := filepath.Join(workspace, "source"+inputExtension)
-	if err := copyUploadToDisk(sourceFile, inputPath); err != nil {
-		writeJSON(writer, http.StatusInternalServerError, errorResponse{Error: "unable to persist uploaded file"})
+	params, inputPath, sourceName, err := streamUploadToWorkspace(request, workspace)
+	if err != nil {
+		writeJSON(writer, http.StatusBadRequest, errorResponse{Error: err.Error()})
 		return
 	}
+	uploadFinishedAt := time.Now()
 
 	baseName := params.OutputName
 	if baseName == "" {
-		baseName = sanitizeName(strings.TrimSuffix(header.Filename, filepath.Ext(header.Filename)))
+		baseName = sanitizeName(strings.TrimSuffix(sourceName, filepath.Ext(sourceName)))
 	}
 	if baseName == "" {
 		baseName = "clip"
 	}
 
 	outputFilename := fmt.Sprintf("%s-%s.gif", baseName, jobID[:8])
-	palettePath := filepath.Join(workspace, "palette.png")
 	outputPath := filepath.Join(s.outputDir, outputFilename)
-	if s.storage.Enabled() {
-		outputPath = filepath.Join(workspace, "rendered.gif")
-	}
 
-	paletteArgs, renderArgs := buildFFmpegCommands(inputPath, palettePath, outputPath, params)
-
-	if output, err := runFFmpeg(ffmpegPath, paletteArgs); err != nil {
+	renderCommands, renderErr := renderGIF(ffmpegPath, workspace, inputPath, outputPath, params)
+	if renderErr != nil {
 		writeJSON(writer, http.StatusInternalServerError, errorResponse{
-			Error: buildFFmpegError("palette generation failed", output, err),
+			Error: renderErr.Error(),
 		})
 		return
 	}
-
-	if output, err := runFFmpeg(ffmpegPath, renderArgs); err != nil {
-		writeJSON(writer, http.StatusInternalServerError, errorResponse{
-			Error: buildFFmpegError("gif rendering failed", output, err),
-		})
-		return
-	}
+	renderFinishedAt := time.Now()
 
 	info, err := os.Stat(outputPath)
 	if err != nil {
@@ -229,15 +196,17 @@ func (s *Server) handleConvert(writer http.ResponseWriter, request *http.Request
 	}
 
 	expiresAt := info.ModTime().Add(jobRetention)
-	if s.storage.Enabled() {
-		asset, uploadErr := s.uploadToOpenList(outputPath, outputFilename, jobID, info.Size())
-		if uploadErr != nil {
-			log.Printf("openlist upload failed for %s: %v", outputFilename, uploadErr)
-			writeJSON(writer, http.StatusBadGateway, errorResponse{Error: "unable to upload gif to openlist"})
-			return
-		}
-		expiresAt = asset.ExpiresAt
-	}
+	localOutputPath := outputPath
+	outputSize := info.Size()
+
+	log.Printf(
+		"job %s ready in %s (upload=%s render=%s storage=%s)",
+		jobID,
+		time.Since(requestStartedAt).Round(time.Millisecond),
+		uploadFinishedAt.Sub(requestStartedAt).Round(time.Millisecond),
+		renderFinishedAt.Sub(uploadFinishedAt).Round(time.Millisecond),
+		storageModeLabel(s.storage.Enabled()),
+	)
 
 	writeJSON(writer, http.StatusOK, conversionResponse{
 		JobID:        jobID,
@@ -246,11 +215,12 @@ func (s *Server) handleConvert(writer http.ResponseWriter, request *http.Request
 		DownloadName: outputFilename,
 		SizeBytes:    info.Size(),
 		ExpiresAt:    expiresAt.Format(time.RFC3339),
-		Commands: []string{
-			ffmpegPath + " " + strings.Join(paletteArgs, " "),
-			ffmpegPath + " " + strings.Join(renderArgs, " "),
-		},
+		Commands:     renderCommands,
 	})
+
+	if s.storage.Enabled() {
+		go s.uploadOutputToOpenListAsync(localOutputPath, outputFilename, jobID, outputSize)
+	}
 }
 
 func (s *Server) handleOutput(writer http.ResponseWriter, request *http.Request) {
@@ -377,13 +347,13 @@ func (s *Server) handleSPA(writer http.ResponseWriter, request *http.Request) {
 	http.ServeFile(writer, request, indexPath)
 }
 
-func parseConversionRequest(request *http.Request) (conversionRequest, error) {
-	fitMode, err := parseChoice(request.FormValue("fitMode"), "contain", []string{"contain", "cover", "stretch", "original"})
+func parseConversionRequest(values url.Values) (conversionRequest, error) {
+	fitMode, err := parseChoice(values.Get("fitMode"), "contain", []string{"contain", "cover", "stretch", "original"})
 	if err != nil {
 		return conversionRequest{}, err
 	}
 
-	dither, err := parseChoice(request.FormValue("dither"), "sierra2_4a", []string{
+	dither, err := parseChoice(values.Get("dither"), "sierra2_4a", []string{
 		"none",
 		"bayer",
 		"heckbert",
@@ -395,17 +365,17 @@ func parseConversionRequest(request *http.Request) (conversionRequest, error) {
 		return conversionRequest{}, err
 	}
 
-	paletteStatsMode, err := parseChoice(request.FormValue("paletteStatsMode"), "full", []string{"full", "diff", "single"})
+	paletteStatsMode, err := parseChoice(values.Get("paletteStatsMode"), "full", []string{"full", "diff", "single"})
 	if err != nil {
 		return conversionRequest{}, err
 	}
 
-	diffMode, err := parseChoice(request.FormValue("diffMode"), "rectangle", []string{"rectangle", "none"})
+	diffMode, err := parseChoice(values.Get("diffMode"), "rectangle", []string{"rectangle", "none"})
 	if err != nil {
 		return conversionRequest{}, err
 	}
 
-	scaleAlgorithm, err := parseChoice(request.FormValue("scaleAlgorithm"), "lanczos", []string{
+	scaleAlgorithm, err := parseChoice(values.Get("scaleAlgorithm"), "lanczos", []string{
 		"lanczos",
 		"bicubic",
 		"bilinear",
@@ -416,32 +386,64 @@ func parseConversionRequest(request *http.Request) (conversionRequest, error) {
 		return conversionRequest{}, err
 	}
 
-	background, err := normalizeHexColor(request.FormValue("background"), "#0f172a")
+	background, err := normalizeHexColor(values.Get("background"), "#0f172a")
 	if err != nil {
 		return conversionRequest{}, err
 	}
 
 	return conversionRequest{
-		FPS:              parseFloat(request.FormValue("fps"), 12, 1, 60),
-		Width:            parseInt(request.FormValue("width"), 0, 0, 4096),
-		Height:           parseInt(request.FormValue("height"), 0, 0, 4096),
+		FPS:              parseFloat(values.Get("fps"), 12, 1, 60),
+		Width:            parseInt(values.Get("width"), 0, 0, 4096),
+		Height:           parseInt(values.Get("height"), 0, 0, 4096),
 		FitMode:          fitMode,
 		Background:       background,
-		Start:            parseFloat(request.FormValue("start"), 0, 0, 86400),
-		Duration:         parseFloat(request.FormValue("duration"), 0, 0, 86400),
-		Speed:            parseFloat(request.FormValue("speed"), 1, 0.1, 8),
-		Loop:             parseInt(request.FormValue("loop"), 0, 0, 1000),
-		MaxColors:        parseInt(request.FormValue("maxColors"), 128, 2, 256),
+		Start:            parseFloat(values.Get("start"), 0, 0, 86400),
+		Duration:         parseFloat(values.Get("duration"), 0, 0, 86400),
+		Speed:            parseFloat(values.Get("speed"), 1, 0.1, 8),
+		Loop:             parseInt(values.Get("loop"), 0, 0, 1000),
+		MaxColors:        parseInt(values.Get("maxColors"), 128, 2, 256),
 		Dither:           dither,
 		PaletteStatsMode: paletteStatsMode,
 		DiffMode:         diffMode,
 		ScaleAlgorithm:   scaleAlgorithm,
-		Reverse:          parseBool(request.FormValue("reverse")),
-		OutputName:       sanitizeName(request.FormValue("outputName")),
+		Reverse:          parseBool(values.Get("reverse")),
+		OutputName:       sanitizeName(values.Get("outputName")),
 	}, nil
 }
 
-func buildFFmpegCommands(inputPath, palettePath, outputPath string, params conversionRequest) ([]string, []string) {
+func buildFFmpegCommand(inputPath, outputPath string, params conversionRequest) []string {
+	timeArgs := make([]string, 0, 4)
+	if params.Start > 0 {
+		timeArgs = append(timeArgs, "-ss", formatSeconds(params.Start))
+	}
+	if params.Duration > 0 {
+		timeArgs = append(timeArgs, "-t", formatSeconds(params.Duration))
+	}
+
+	baseFilter := strings.Join(buildVideoFilters(params), ",")
+	filterGraph := fmt.Sprintf(
+		"[0:v]%s,split=2[palette_src][gif_src];[palette_src]palettegen=max_colors=%d:stats_mode=%s[palette];[gif_src][palette]paletteuse=dither=%s:diff_mode=%s[gif]",
+		baseFilter,
+		params.MaxColors,
+		params.PaletteStatsMode,
+		params.Dither,
+		params.DiffMode,
+	)
+
+	commandArgs := append([]string{"-y"}, timeArgs...)
+	commandArgs = append(commandArgs,
+		"-i", inputPath,
+		"-filter_complex", filterGraph,
+		"-map", "[gif]",
+		"-an",
+		"-loop", strconv.Itoa(params.Loop),
+		outputPath,
+	)
+
+	return commandArgs
+}
+
+func buildFFmpegFallbackCommands(inputPath, palettePath, outputPath string, params conversionRequest) ([]string, []string) {
 	timeArgs := make([]string, 0, 4)
 	if params.Start > 0 {
 		timeArgs = append(timeArgs, "-ss", formatSeconds(params.Start))
@@ -614,10 +616,136 @@ func copyUploadToDisk(source io.Reader, targetPath string) error {
 	return err
 }
 
+func streamUploadToWorkspace(request *http.Request, workspace string) (conversionRequest, string, string, error) {
+	reader, err := request.MultipartReader()
+	if err != nil {
+		return conversionRequest{}, "", "", errors.New("request must use multipart/form-data")
+	}
+
+	values := url.Values{}
+	var inputPath string
+	var sourceName string
+
+	for {
+		part, nextErr := reader.NextPart()
+		if errors.Is(nextErr, io.EOF) {
+			break
+		}
+		if nextErr != nil {
+			return conversionRequest{}, "", "", errors.New("unable to read upload stream")
+		}
+
+		partName := part.FormName()
+		fileName := strings.TrimSpace(part.FileName())
+
+		switch {
+		case fileName != "":
+			if partName != "video" {
+				_, _ = io.Copy(io.Discard, part)
+				_ = part.Close()
+				continue
+			}
+			if inputPath != "" {
+				_ = part.Close()
+				return conversionRequest{}, "", "", errors.New("only one video file is supported")
+			}
+
+			sourceName = filepath.Base(fileName)
+			inputExtension := strings.ToLower(filepath.Ext(sourceName))
+			if inputExtension == "" {
+				inputExtension = guessExtension(part.Header.Get("Content-Type"))
+			}
+			if inputExtension == "" {
+				inputExtension = ".mp4"
+			}
+
+			inputPath = filepath.Join(workspace, "source"+inputExtension)
+			copyErr := copyUploadToDisk(part, inputPath)
+			_ = part.Close()
+			if copyErr != nil {
+				return conversionRequest{}, "", "", errors.New("unable to persist uploaded file")
+			}
+		case partName != "":
+			payload, readErr := io.ReadAll(io.LimitReader(part, 64<<10))
+			_ = part.Close()
+			if readErr != nil {
+				return conversionRequest{}, "", "", errors.New("unable to read form fields")
+			}
+			values.Set(partName, strings.TrimSpace(string(payload)))
+		default:
+			_ = part.Close()
+		}
+	}
+
+	if inputPath == "" {
+		return conversionRequest{}, "", "", errors.New("video file is required")
+	}
+
+	params, err := parseConversionRequest(values)
+	if err != nil {
+		return conversionRequest{}, "", "", err
+	}
+
+	return params, inputPath, sourceName, nil
+}
+
 func runFFmpeg(ffmpegPath string, args []string) (string, error) {
 	command := exec.Command(ffmpegPath, args...)
 	output, err := command.CombinedOutput()
 	return string(output), err
+}
+
+func renderGIF(ffmpegPath, workspace, inputPath, outputPath string, params conversionRequest) ([]string, error) {
+	singlePassArgs := buildFFmpegCommand(inputPath, outputPath, params)
+	commands := []string{ffmpegPath + " " + strings.Join(singlePassArgs, " ")}
+
+	output, err := runFFmpeg(ffmpegPath, singlePassArgs)
+	if err == nil {
+		return commands, nil
+	}
+
+	if !shouldFallbackToTwoPass(output) {
+		return commands, errors.New(buildFFmpegError("gif rendering failed", output, err))
+	}
+
+	_ = deleteFileIfExists(outputPath)
+	palettePath := filepath.Join(workspace, "palette.png")
+	paletteArgs, renderArgs := buildFFmpegFallbackCommands(inputPath, palettePath, outputPath, params)
+	commands = append(commands,
+		ffmpegPath+" "+strings.Join(paletteArgs, " "),
+		ffmpegPath+" "+strings.Join(renderArgs, " "),
+	)
+
+	log.Printf("single-pass gif render produced zero frames, retrying with two-pass palette fallback")
+
+	if paletteOutput, paletteErr := runFFmpeg(ffmpegPath, paletteArgs); paletteErr != nil {
+		return commands, errors.New(buildFFmpegError("palette generation failed during fallback", paletteOutput, paletteErr))
+	}
+
+	if renderOutput, renderErr := runFFmpeg(ffmpegPath, renderArgs); renderErr != nil {
+		return commands, errors.New(buildFFmpegError("gif rendering failed during fallback", renderOutput, renderErr))
+	}
+
+	return commands, nil
+}
+
+func shouldFallbackToTwoPass(output string) bool {
+	return strings.Contains(output, "No filtered frames for output stream") ||
+		strings.Contains(output, "Output file is empty, nothing was encoded")
+}
+
+func (s *Server) uploadOutputToOpenListAsync(localPath, downloadName, jobID string, sizeBytes int64) {
+	startedAt := time.Now()
+	if err := s.promoteOutputToOpenList(localPath, downloadName, jobID, sizeBytes); err != nil {
+		log.Printf("job %s async openlist upload failed for %s: %v", jobID, downloadName, err)
+		return
+	}
+
+	log.Printf(
+		"job %s async openlist upload completed in %s",
+		jobID,
+		time.Since(startedAt).Round(time.Millisecond),
+	)
 }
 
 func buildFFmpegError(prefix, output string, commandError error) string {
@@ -732,6 +860,13 @@ func writeJSON(writer http.ResponseWriter, statusCode int, payload any) {
 	writer.Header().Set("Content-Type", "application/json; charset=utf-8")
 	writer.WriteHeader(statusCode)
 	_ = json.NewEncoder(writer).Encode(payload)
+}
+
+func storageModeLabel(remote bool) string {
+	if remote {
+		return "openlist-async"
+	}
+	return "local"
 }
 
 func renderMissingFrontend(writer http.ResponseWriter) {

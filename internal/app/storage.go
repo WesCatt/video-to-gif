@@ -188,18 +188,37 @@ func (s *Server) deleteOutputAsset(asset outputAsset) error {
 		return deleteFileIfExists(asset.ManifestPath)
 	}
 
-	return deleteFileIfExists(asset.LocalPath)
+	if err := deleteFileIfExists(asset.LocalPath); err != nil {
+		return err
+	}
+
+	manifestFile := manifestPath(s.outputDir, asset.Name)
+	manifest, err := readManifest(manifestFile)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+
+	if manifest.RemotePath != "" {
+		if err := s.removeOpenListFile(manifest.RemotePath); err != nil {
+			return err
+		}
+	}
+
+	return deleteFileIfExists(manifestFile)
 }
 
-func (s *Server) uploadToOpenList(localPath, downloadName, jobID string, sizeBytes int64) (outputAsset, error) {
+func (s *Server) uploadToOpenList(localPath, downloadName string, sizeBytes int64) (string, error) {
 	remotePath := path.Join(s.storage.RemoteVideoDir(), downloadName)
 	if err := s.ensureOpenListDirectory(path.Dir(remotePath)); err != nil {
-		return outputAsset{}, err
+		return "", err
 	}
 
 	file, err := os.Open(localPath)
 	if err != nil {
-		return outputAsset{}, err
+		return "", err
 	}
 	defer file.Close()
 
@@ -209,25 +228,34 @@ func (s *Server) uploadToOpenList(localPath, downloadName, jobID string, sizeByt
 		request.ContentLength = sizeBytes
 	})
 	if err != nil {
-		return outputAsset{}, err
+		return "", err
 	}
 	defer response.Body.Close()
 
 	if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusCreated && response.StatusCode != http.StatusNoContent {
-		return outputAsset{}, fmt.Errorf("openlist upload failed: %s", response.Status)
+		return "", fmt.Errorf("openlist upload failed: %s", response.Status)
+	}
+
+	return remotePath, nil
+}
+
+func (s *Server) promoteOutputToOpenList(localPath, downloadName, jobID string, sizeBytes int64) error {
+	remotePath, err := s.uploadToOpenList(localPath, downloadName, sizeBytes)
+	if err != nil {
+		return err
+	}
+
+	if _, err := os.Stat(localPath); err != nil {
+		_ = s.removeOpenListFile(remotePath)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
 	}
 
 	expiresAt := time.Now().Add(jobRetention)
-	asset := outputAsset{
-		Name:         downloadName,
-		ManifestPath: manifestPath(s.outputDir, downloadName),
-		RemotePath:   remotePath,
-		SizeBytes:    sizeBytes,
-		ExpiresAt:    expiresAt,
-		Remote:       true,
-	}
-
-	if err := writeManifest(asset.ManifestPath, gifManifest{
+	manifestFile := manifestPath(s.outputDir, downloadName)
+	if err := writeManifest(manifestFile, gifManifest{
 		JobID:        jobID,
 		DownloadName: downloadName,
 		RemotePath:   remotePath,
@@ -235,10 +263,10 @@ func (s *Server) uploadToOpenList(localPath, downloadName, jobID string, sizeByt
 		ExpiresAt:    expiresAt.Format(time.RFC3339),
 	}); err != nil {
 		_ = s.removeOpenListFile(remotePath)
-		return outputAsset{}, err
+		return err
 	}
 
-	return asset, nil
+	return deleteFileIfExists(localPath)
 }
 
 func (s *Server) proxyOpenListFile(writer http.ResponseWriter, request *http.Request, asset outputAsset, asAttachment bool) {
