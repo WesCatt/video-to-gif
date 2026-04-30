@@ -40,7 +40,7 @@ This project is a tool-first conversion workspace focused on a fast edit loop:
 | Frontend | React + Vite |
 | Backend | Go |
 | Media pipeline | `ffmpeg` |
-| Remote storage | OpenList WebDAV (optional) |
+| Remote storage | OpenList API (optional) |
 
 ## Local Development
 
@@ -153,9 +153,10 @@ OPENLIST_VIDEO_PATH=/video-to-gif
 Notes:
 
 - `OPENLIST_BASE_URL` is your OpenList site URL
-- the app uses OpenList WebDAV at `/dav/`
+- the app logs in to OpenList through `/api/auth/login`
+- uploads use OpenList API endpoints such as `/api/fs/mkdir`, `/api/fs/put`, `/api/fs/get`, and `/api/fs/remove`
 - `OPENLIST_VIDEO_PATH` is the remote folder path inside OpenList
-- the OpenList account needs read, upload, and delete related permissions
+- the OpenList account needs read, upload, directory create, and delete related permissions
 - in OpenList mode, GIF binaries go to remote storage and local `outputs/` only keeps lightweight metadata
 
 ## Runtime Directories

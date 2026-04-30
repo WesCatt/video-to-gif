@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,8 @@ import (
 	"strings"
 	"time"
 )
+
+const openListTokenTTL = 6 * time.Hour
 
 type StorageConfig struct {
 	OpenListBaseURL   string
@@ -39,6 +42,41 @@ type outputAsset struct {
 	Remote       bool
 }
 
+type openListResponse[T any] struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+	Data    T      `json:"data"`
+}
+
+type openListLoginRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+type openListLoginData struct {
+	Token string `json:"token"`
+}
+
+type openListMkdirRequest struct {
+	Path string `json:"path"`
+}
+
+type openListGetRequest struct {
+	Path     string `json:"path"`
+	Password string `json:"password,omitempty"`
+	Refresh  bool   `json:"refresh"`
+}
+
+type openListGetData struct {
+	IsDir  bool   `json:"is_dir"`
+	RawURL string `json:"raw_url"`
+}
+
+type openListRemoveRequest struct {
+	Dir   string   `json:"dir"`
+	Names []string `json:"names"`
+}
+
 func (c StorageConfig) Enabled() bool {
 	return strings.TrimSpace(c.OpenListBaseURL) != ""
 }
@@ -52,7 +90,7 @@ func (c StorageConfig) RemoteVideoDir() string {
 	return path.Clean("/" + strings.TrimPrefix(target, "/"))
 }
 
-func (c StorageConfig) WebDAVRootURL() (*url.URL, error) {
+func (c StorageConfig) APIRootURL() (*url.URL, error) {
 	baseURL := strings.TrimSpace(c.OpenListBaseURL)
 	if baseURL == "" {
 		return nil, errors.New("OPENLIST_BASE_URL is empty")
@@ -63,14 +101,7 @@ func (c StorageConfig) WebDAVRootURL() (*url.URL, error) {
 		return nil, err
 	}
 
-	cleanPath := strings.TrimSuffix(parsed.Path, "/")
-	if cleanPath == "" {
-		cleanPath = "/dav"
-	} else if !strings.HasSuffix(cleanPath, "/dav") {
-		cleanPath += "/dav"
-	}
-
-	parsed.Path = cleanPath + "/"
+	parsed.Path = strings.TrimSuffix(parsed.Path, "/") + "/"
 	parsed.RawPath = ""
 	return parsed, nil
 }
@@ -149,7 +180,7 @@ func (s *Server) resolveOutputAsset(outputName string) (outputAsset, error) {
 func (s *Server) deleteOutputAsset(asset outputAsset) error {
 	if asset.Remote {
 		if asset.RemotePath != "" {
-			if err := s.deleteFromOpenList(asset.RemotePath); err != nil {
+			if err := s.removeOpenListFile(asset.RemotePath); err != nil {
 				return err
 			}
 		}
@@ -172,20 +203,17 @@ func (s *Server) uploadToOpenList(localPath, downloadName, jobID string, sizeByt
 	}
 	defer file.Close()
 
-	request, err := s.newOpenListRequest(http.MethodPut, remotePath, file)
-	if err != nil {
-		return outputAsset{}, err
-	}
-	request.ContentLength = sizeBytes
-	request.Header.Set("Content-Type", "image/gif")
-
-	response, err := http.DefaultClient.Do(request)
+	response, err := s.doOpenListRequest(http.MethodPut, []string{"api", "fs", "put"}, file, true, func(request *http.Request) {
+		request.Header.Set("File-Path", url.PathEscape(remotePath))
+		request.Header.Set("Content-Type", "image/gif")
+		request.ContentLength = sizeBytes
+	})
 	if err != nil {
 		return outputAsset{}, err
 	}
 	defer response.Body.Close()
 
-	if response.StatusCode != http.StatusCreated && response.StatusCode != http.StatusOK && response.StatusCode != http.StatusNoContent {
+	if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusCreated && response.StatusCode != http.StatusNoContent {
 		return outputAsset{}, fmt.Errorf("openlist upload failed: %s", response.Status)
 	}
 
@@ -206,37 +234,29 @@ func (s *Server) uploadToOpenList(localPath, downloadName, jobID string, sizeByt
 		SizeBytes:    sizeBytes,
 		ExpiresAt:    expiresAt.Format(time.RFC3339),
 	}); err != nil {
-		_ = s.deleteFromOpenList(remotePath)
+		_ = s.removeOpenListFile(remotePath)
 		return outputAsset{}, err
 	}
 
 	return asset, nil
 }
 
-func (s *Server) deleteFromOpenList(remotePath string) error {
-	request, err := s.newOpenListRequest(http.MethodDelete, remotePath, nil)
-	if err != nil {
-		return err
-	}
-
-	response, err := http.DefaultClient.Do(request)
-	if err != nil {
-		return err
-	}
-	defer response.Body.Close()
-
-	switch response.StatusCode {
-	case http.StatusOK, http.StatusNoContent, http.StatusNotFound:
-		return nil
-	default:
-		return fmt.Errorf("openlist delete failed: %s", response.Status)
-	}
-}
-
 func (s *Server) proxyOpenListFile(writer http.ResponseWriter, request *http.Request, asset outputAsset, asAttachment bool) {
-	upstreamRequest, err := s.newOpenListRequest(request.Method, asset.RemotePath, nil)
+	rawURL, err := s.resolveOpenListRawURL(asset.RemotePath)
 	if err != nil {
-		http.Error(writer, "unable to build openlist request", http.StatusInternalServerError)
+		http.Error(writer, "unable to resolve remote gif url", http.StatusBadGateway)
+		return
+	}
+
+	writer.Header().Set("Cache-Control", "no-store")
+	if asAttachment {
+		http.Redirect(writer, request, rawURL, http.StatusFound)
+		return
+	}
+
+	upstreamRequest, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	if err != nil {
+		http.Error(writer, "unable to build preview request", http.StatusInternalServerError)
 		return
 	}
 
@@ -247,30 +267,18 @@ func (s *Server) proxyOpenListFile(writer http.ResponseWriter, request *http.Req
 	}
 	defer response.Body.Close()
 
-	if response.StatusCode == http.StatusNotFound {
-		_ = deleteFileIfExists(asset.ManifestPath)
-		http.NotFound(writer, request)
-		return
-	}
-
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		http.Error(writer, "remote gif request failed", http.StatusBadGateway)
 		return
 	}
 
-	writer.Header().Set("Cache-Control", "no-store")
-	writer.Header().Set("Expires", asset.ExpiresAt.UTC().Format(http.TimeFormat))
-	if contentType := response.Header.Get("Content-Type"); contentType != "" {
-		writer.Header().Set("Content-Type", contentType)
-	}
+	writer.Header().Set("Content-Type", "image/gif")
+	writer.Header().Set("Content-Disposition", "inline")
 	if contentLength := response.Header.Get("Content-Length"); contentLength != "" {
 		writer.Header().Set("Content-Length", contentLength)
 	}
-	if asAttachment {
-		writer.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", asset.Name))
-	}
+	writer.WriteHeader(http.StatusOK)
 
-	writer.WriteHeader(response.StatusCode)
 	if request.Method == http.MethodHead {
 		return
 	}
@@ -284,52 +292,239 @@ func (s *Server) ensureOpenListDirectory(remoteDir string) error {
 		return nil
 	}
 
-	current := ""
-	for _, part := range strings.Split(strings.Trim(remoteDir, "/"), "/") {
-		current += "/" + part
+	exists, err := s.openListPathExists(remoteDir)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return nil
+	}
 
-		request, err := s.newOpenListRequest("MKCOL", current, nil)
-		if err != nil {
-			return err
-		}
+	payload, err := json.Marshal(openListMkdirRequest{Path: remoteDir})
+	if err != nil {
+		return err
+	}
 
-		response, err := http.DefaultClient.Do(request)
-		if err != nil {
-			return err
-		}
-		response.Body.Close()
+	response, err := s.doOpenListRequest(http.MethodPost, []string{"api", "fs", "mkdir"}, bytes.NewReader(payload), true, func(request *http.Request) {
+		request.Header.Set("Content-Type", "application/json")
+	})
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
 
-		switch response.StatusCode {
-		case http.StatusCreated, http.StatusOK, http.StatusNoContent, http.StatusMethodNotAllowed:
-			continue
-		default:
-			return fmt.Errorf("openlist mkdir failed for %s: %s", current, response.Status)
-		}
+	var result openListResponse[struct{}]
+	if err := decodeOpenListResponse(response, &result); err != nil {
+		return err
+	}
+
+	if result.Code != 200 {
+		return fmt.Errorf("openlist mkdir failed: %s", result.Message)
 	}
 
 	return nil
 }
 
-func (s *Server) newOpenListRequest(method, remotePath string, body io.Reader) (*http.Request, error) {
-	rootURL, err := s.storage.WebDAVRootURL()
+func (s *Server) openListPathExists(remotePath string) (bool, error) {
+	payload, err := json.Marshal(openListGetRequest{
+		Path:    remotePath,
+		Refresh: false,
+	})
+	if err != nil {
+		return false, err
+	}
+
+	response, err := s.doOpenListRequest(http.MethodPost, []string{"api", "fs", "get"}, bytes.NewReader(payload), true, func(request *http.Request) {
+		request.Header.Set("Content-Type", "application/json")
+	})
+	if err != nil {
+		return false, err
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode == http.StatusNotFound {
+		return false, nil
+	}
+
+	var result openListResponse[openListGetData]
+	if err := decodeOpenListResponse(response, &result); err != nil {
+		return false, err
+	}
+
+	return result.Code == 200, nil
+}
+
+func (s *Server) removeOpenListFile(remotePath string) error {
+	payload, err := json.Marshal(openListRemoveRequest{
+		Dir:   path.Dir(remotePath),
+		Names: []string{path.Base(remotePath)},
+	})
+	if err != nil {
+		return err
+	}
+
+	response, err := s.doOpenListRequest(http.MethodPost, []string{"api", "fs", "remove"}, bytes.NewReader(payload), true, func(request *http.Request) {
+		request.Header.Set("Content-Type", "application/json")
+	})
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+
+	var result openListResponse[struct{}]
+	if err := decodeOpenListResponse(response, &result); err != nil {
+		return err
+	}
+
+	if result.Code != 200 {
+		return fmt.Errorf("openlist remove failed: %s", result.Message)
+	}
+
+	return nil
+}
+
+func (s *Server) resolveOpenListRawURL(remotePath string) (string, error) {
+	payload, err := json.Marshal(openListGetRequest{
+		Path:    remotePath,
+		Refresh: true,
+	})
+	if err != nil {
+		return "", err
+	}
+
+	response, err := s.doOpenListRequest(http.MethodPost, []string{"api", "fs", "get"}, bytes.NewReader(payload), true, func(request *http.Request) {
+		request.Header.Set("Content-Type", "application/json")
+	})
+	if err != nil {
+		return "", err
+	}
+	defer response.Body.Close()
+
+	var result openListResponse[openListGetData]
+	if err := decodeOpenListResponse(response, &result); err != nil {
+		return "", err
+	}
+
+	if result.Code != 200 || strings.TrimSpace(result.Data.RawURL) == "" {
+		return "", fmt.Errorf("openlist get failed: %s", result.Message)
+	}
+
+	return result.Data.RawURL, nil
+}
+
+func (s *Server) getOpenListToken(forceRefresh bool) (string, error) {
+	s.tokenMu.Lock()
+	defer s.tokenMu.Unlock()
+
+	if !forceRefresh && s.token != "" && time.Since(s.tokenAt) < openListTokenTTL {
+		return s.token, nil
+	}
+
+	payload, err := json.Marshal(openListLoginRequest{
+		Username: s.storage.OpenListUsername,
+		Password: s.storage.OpenListPassword,
+	})
+	if err != nil {
+		return "", err
+	}
+
+	response, err := s.doOpenListRequest(http.MethodPost, []string{"api", "auth", "login"}, bytes.NewReader(payload), false, func(request *http.Request) {
+		request.Header.Set("Content-Type", "application/json")
+	})
+	if err != nil {
+		return "", err
+	}
+	defer response.Body.Close()
+
+	var result openListResponse[openListLoginData]
+	if err := decodeOpenListResponse(response, &result); err != nil {
+		return "", err
+	}
+
+	if result.Code != 200 || strings.TrimSpace(result.Data.Token) == "" {
+		return "", fmt.Errorf("openlist login failed: %s", result.Message)
+	}
+
+	s.token = result.Data.Token
+	s.tokenAt = time.Now()
+	return s.token, nil
+}
+
+func (s *Server) doOpenListRequest(method string, segments []string, body io.Reader, withAuth bool, mutate func(*http.Request)) (*http.Response, error) {
+	attempts := 1
+	if withAuth {
+		attempts = 2
+	}
+
+	for attempt := 0; attempt < attempts; attempt++ {
+		var token string
+		if withAuth {
+			forceRefresh := attempt > 0
+			nextToken, err := s.getOpenListToken(forceRefresh)
+			if err != nil {
+				return nil, err
+			}
+			token = nextToken
+		}
+
+		var requestBody io.Reader
+		if seeker, ok := body.(io.ReadSeeker); ok {
+			_, _ = seeker.Seek(0, io.SeekStart)
+			requestBody = seeker
+		} else {
+			requestBody = body
+		}
+
+		request, err := s.newOpenListRequest(method, segments, requestBody)
+		if err != nil {
+			return nil, err
+		}
+		if withAuth {
+			request.Header.Set("Authorization", token)
+		}
+		if mutate != nil {
+			mutate(request)
+		}
+
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			return nil, err
+		}
+
+		if withAuth && (response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden) && attempt == 0 {
+			response.Body.Close()
+			s.tokenMu.Lock()
+			s.token = ""
+			s.tokenAt = time.Time{}
+			s.tokenMu.Unlock()
+			continue
+		}
+
+		return response, nil
+	}
+
+	return nil, errors.New("openlist request failed after retry")
+}
+
+func (s *Server) newOpenListRequest(method string, segments []string, body io.Reader) (*http.Request, error) {
+	rootURL, err := s.storage.APIRootURL()
 	if err != nil {
 		return nil, err
 	}
 
-	cleanPath := path.Clean("/" + strings.TrimPrefix(strings.TrimSpace(remotePath), "/"))
-	var targetURL *url.URL
-	if cleanPath == "/" || cleanPath == "." {
-		targetURL = rootURL
-	} else {
-		segments := strings.Split(strings.Trim(cleanPath, "/"), "/")
-		targetURL = rootURL.JoinPath(segments...)
+	targetURL := rootURL.JoinPath(segments...)
+	return http.NewRequest(method, targetURL.String(), body)
+}
+
+func decodeOpenListResponse[T any](response *http.Response, payload *openListResponse[T]) error {
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
+		return fmt.Errorf("openlist request failed: %s %s", response.Status, strings.TrimSpace(string(body)))
 	}
 
-	request, err := http.NewRequest(method, targetURL.String(), body)
-	if err != nil {
-		return nil, err
+	if err := json.NewDecoder(response.Body).Decode(payload); err != nil {
+		return err
 	}
 
-	request.SetBasicAuth(s.storage.OpenListUsername, s.storage.OpenListPassword)
-	return request, nil
+	return nil
 }

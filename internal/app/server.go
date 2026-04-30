@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"mime"
 	"net/http"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -36,6 +38,9 @@ type Server struct {
 	outputDir string
 	tempDir   string
 	storage   StorageConfig
+	tokenMu   sync.Mutex
+	token     string
+	tokenAt   time.Time
 }
 
 type conversionRequest struct {
@@ -227,6 +232,7 @@ func (s *Server) handleConvert(writer http.ResponseWriter, request *http.Request
 	if s.storage.Enabled() {
 		asset, uploadErr := s.uploadToOpenList(outputPath, outputFilename, jobID, info.Size())
 		if uploadErr != nil {
+			log.Printf("openlist upload failed for %s: %v", outputFilename, uploadErr)
 			writeJSON(writer, http.StatusBadGateway, errorResponse{Error: "unable to upload gif to openlist"})
 			return
 		}
