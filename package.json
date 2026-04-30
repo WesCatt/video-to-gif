@@ -7,6 +7,7 @@
     "dev": "node scripts/dev.mjs",
     "dev:web": "vite",
     "build": "vite build",
+    "build:linux": "node scripts/build-linux.mjs",
     "preview": "vite preview",
     "server": "node scripts/run-go.mjs",
     "start": "node scripts/run-go.mjs",

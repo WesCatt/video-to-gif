@@ -12,14 +12,14 @@ Video-to-GIF workbench built with Go, React, and `ffmpeg`.
 
 ## Overview
 
-This project is a tool-first conversion workspace, not a landing page. It focuses on a fast edit loop:
+This project is a tool-first conversion workspace focused on a fast edit loop:
 
 - drop a video anywhere on the page
-- tune timing, FPS, size, loop, palette, dither, scaling, and reverse playback
+- adjust timing, FPS, size, loop, palette, dither, scaling, and reverse playback
 - render and preview the GIF immediately
-- download, track, and remove active GIFs from the current browser session
+- download, track, and delete active GIFs from the current browser session
 
-## Feature Table
+## Features
 
 | Area | What it does |
 | --- | --- |
@@ -42,7 +42,7 @@ This project is a tool-first conversion workspace, not a landing page. It focuse
 | Media pipeline | `ffmpeg` |
 | Remote storage | OpenList WebDAV (optional) |
 
-## Quick Start
+## Local Development
 
 Prerequisites:
 
@@ -80,21 +80,68 @@ Build then start:
 npm run start:build
 ```
 
-## Runtime Directories
+## Build Linux Bundle
 
-| Path | Purpose |
-| --- | --- |
-| `dist/` | Frontend build output |
-| `temp/` | Temporary upload and palette files |
-| `outputs/` | Local GIF files or OpenList metadata manifests |
+This repository includes a packaging script that packages:
 
-`temp/` and `outputs/` are runtime directories and should not be committed. The repo only keeps `.gitkeep` placeholders.
+- existing frontend production assets
+- Linux `amd64` Go binary
+- deployable bundle under `release/video-to-gif-linux-amd64/`
+
+Build frontend first:
+
+```bash
+npm run build
+```
+
+Then build the Linux bundle:
+
+```bash
+npm run build:linux
+```
+
+After it finishes, the bundle will contain:
+
+- `video-to-gif`
+- `dist/`
+- `outputs/`
+- `temp/`
+- `.env.example`
+- `start.sh`
+- `DEPLOY.md`
+
+## Deploy To Linux
+
+Upload the generated `release/video-to-gif-linux-amd64/` directory to your server.
+
+Server requirements:
+
+- Linux `amd64`
+- `ffmpeg` installed and available in `PATH`
+
+Start the app:
+
+```bash
+chmod +x video-to-gif start.sh
+./start.sh
+```
+
+Or explicitly set the port:
+
+```bash
+PORT=430 ./start.sh
+```
+
+Note:
+
+- if you write `0430`, the real TCP port is still `430`
+- after startup, open `http://your-server:430`
 
 ## OpenList Storage
 
 By default, rendered GIFs are stored locally in `outputs/`.
 
-To upload rendered GIFs to OpenList instead, create a `.env` file in the project root:
+To upload rendered GIFs to OpenList instead, create a `.env` file in the project root or next to the deployed binary:
 
 ```env
 OPENLIST_BASE_URL=https://your-openlist.example.com
@@ -111,17 +158,15 @@ Notes:
 - the OpenList account needs read, upload, and delete related permissions
 - in OpenList mode, GIF binaries go to remote storage and local `outputs/` only keeps lightweight metadata
 
-## Deployment
+## Runtime Directories
 
-For a typical Linux deployment you only need:
+| Path | Purpose |
+| --- | --- |
+| `dist/` | Frontend build output |
+| `temp/` | Temporary upload and palette files |
+| `outputs/` | Local GIF files or OpenList metadata manifests |
 
-- compiled Go binary
-- `dist/`
-- writable `temp/`
-- writable `outputs/`
-- `ffmpeg`
-
-The generated deployment bundle in `release/` is local packaging output and is intentionally ignored by Git.
+`temp/` and `outputs/` are runtime directories and should not be committed. The repo only keeps `.gitkeep` placeholders.
 
 ## Repository Hygiene
 
