@@ -1,5 +1,7 @@
 # Video to GIF
 
+Want try?  [Click to demo page](http://gif.westcat.cn)
+
 Video-to-GIF workbench built with Go, React, and `ffmpeg`.
 
 <p align="center">
@@ -21,25 +23,25 @@ This project is a tool-first conversion workspace focused on a fast edit loop:
 
 ## Features
 
-| Area | What it does |
-| --- | --- |
-| Upload flow | Click-to-upload plus global drag-and-drop across the whole page |
+| Area                | What it does                                                                                       |
+|---------------------|----------------------------------------------------------------------------------------------------|
+| Upload flow         | Click-to-upload plus global drag-and-drop across the whole page                                    |
 | Conversion controls | Start time, duration, speed, FPS, width, height, fit mode, loop, palette, dither, scaling, reverse |
-| Preview | Source video preview and rendered GIF preview in the same workspace |
-| Persistence | Conversion parameters stay after refresh until the user presses reset |
-| GIF management | Active GIF list with countdown, download, and manual delete |
-| Expiration | GIFs expire automatically and are cleaned up by the backend |
-| Language | Chinese / English UI switching |
-| Theme | Light / dark theme support |
-| Storage | Local `outputs/` mode or OpenList WebDAV upload mode |
+| Preview             | Source video preview and rendered GIF preview in the same workspace                                |
+| Persistence         | Conversion parameters stay after refresh until the user presses reset                              |
+| GIF management      | Active GIF list with countdown, download, and manual delete                                        |
+| Expiration          | GIFs expire automatically and are cleaned up by the backend                                        |
+| Language            | Chinese / English UI switching                                                                     |
+| Theme               | Light / dark theme support                                                                         |
+| Storage             | Local `outputs/` mode or OpenList WebDAV upload mode                                               |
 
 ## Stack
 
-| Layer | Tech |
-| --- | --- |
-| Frontend | React + Vite |
-| Backend | Go |
-| Media pipeline | `ffmpeg` |
+| Layer          | Tech                    |
+|----------------|-------------------------|
+| Frontend       | React + Vite            |
+| Backend        | Go                      |
+| Media pipeline | `ffmpeg`                |
 | Remote storage | OpenList API (optional) |
 
 ## Local Development
@@ -161,10 +163,10 @@ Notes:
 
 ## Runtime Directories
 
-| Path | Purpose |
-| --- | --- |
-| `dist/` | Frontend build output |
-| `temp/` | Temporary upload and palette files |
+| Path       | Purpose                                        |
+|------------|------------------------------------------------|
+| `dist/`    | Frontend build output                          |
+| `temp/`    | Temporary upload and palette files             |
 | `outputs/` | Local GIF files or OpenList metadata manifests |
 
 `temp/` and `outputs/` are runtime directories and should not be committed. The repo only keeps `.gitkeep` placeholders.
